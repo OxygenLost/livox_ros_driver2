@@ -10,6 +10,7 @@ echo "Working Path: "`pwd`
 
 ROS_VERSION=""
 ROS_HUMBLE=""
+COLCON_INSTALL_ARGS=""
 
 # Set working ROS version
 if [ "$1" = "ROS2" ]; then
@@ -17,6 +18,7 @@ if [ "$1" = "ROS2" ]; then
 elif [ "$1" = "humble" ]; then
     ROS_VERSION=${VERSION_ROS2}
     ROS_HUMBLE=${VERSION_HUMBLE}
+    COLCON_INSTALL_ARGS="--symlink-install"
 elif [ "$1" = "ROS1" ]; then
     ROS_VERSION=${VERSION_ROS1}
 else
@@ -48,7 +50,6 @@ elif [ ${ROS_VERSION} = ${VERSION_ROS2} ]; then
         rm package.xml
     fi
     cp -f package_ROS2.xml package.xml
-    cp -rf launch_ROS2/ launch/
 fi
 
 # build
@@ -58,13 +59,8 @@ if [ $ROS_VERSION = ${VERSION_ROS1} ]; then
     catkin_make -DROS_EDITION=${VERSION_ROS1}
 elif [ $ROS_VERSION = ${VERSION_ROS2} ]; then
     cd ../../
-    colcon build --cmake-args -DROS_EDITION=${VERSION_ROS2} -DHUMBLE_ROS=${ROS_HUMBLE}
+    colcon build ${COLCON_INSTALL_ARGS} --cmake-args -DROS_EDITION=${VERSION_ROS2} -DHUMBLE_ROS=${ROS_HUMBLE}
 fi
 popd > /dev/null
-
-# remove the substituted folders/files
-if [ $ROS_VERSION = ${VERSION_ROS2} ]; then
-    rm -rf launch/
-fi
 
 popd > /dev/null
