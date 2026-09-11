@@ -1,6 +1,6 @@
 # Livox ROS Driver 2 - Auto-Level Edition
 
-基于 Livox ROS Driver 2 官方驱动的增强版本，新增 **MID360 自动水平校准**功能，支持雷达任意角度安装（倾斜/倒置），自动矫正输出的点云与 IMU 数据为水平坐标系，无需手动测量安装角度。
+基于 Livox ROS Driver 2 官方驱动的增强版本，新增 **MID360 / MID360S 自动水平校准**功能，支持雷达任意角度安装（倾斜/倒置），自动矫正输出的点云与 IMU 数据为水平坐标系，无需手动测量安装角度。
 
 ## 核心特性
 
@@ -15,7 +15,7 @@
 
 ### 📦 兼容原版功能
 
-- 支持 HAP / MID360 / 混合多雷达
+- 支持 HAP / MID360 / MID360S / 混合多雷达
 - PointCloud2 / CustomMsg / PCL 格式
 - ROS1 (Noetic) / ROS2 (Foxy/Humble)
 
@@ -32,7 +32,7 @@ sudo apt install ros-noetic-desktop-full
 ```
 
 #### Livox SDK 2
-参考官方文档：[Livox-SDK2 安装说明](https://github.com/Livox-SDK/Livox-SDK2)
+参考官方文档：[Livox-SDK2 安装说明](https://github.com/Livox-SDK/Livox-SDK2)。MID360S 需要使用包含 `kLivoxLidarTypeMid360s` 支持的 SDK2（已验证 SDK2 1.3.0 / 1.3.1）。
 
 ### 2. 编译
 
@@ -92,6 +92,9 @@ roslaunch livox_ros_driver2 rviz_MID360.launch
 
 # MID360 + CustomMsg（faster-lio 建图）
 roslaunch livox_ros_driver2 msg_MID360.launch xfer_format:=1
+
+# MID360S + CustomMsg
+roslaunch livox_ros_driver2 msg_MID360s.launch xfer_format:=1
 ```
 
 ---
@@ -117,6 +120,8 @@ roslaunch livox_ros_driver2 msg_MID360.launch xfer_format:=1
 ### 核心配置参数
 
 #### `config/MID360_config.json`（或自定义路径）
+
+本仓库的通用 MID360 配置同时注册 `MID360` 和 `Mid360s` 两个 SDK 设备类型，因此自动校准链路可直接接收普通 MID360（`dev_type=9`）或 MID360S（`dev_type=35`）。也提供独立的 `config/MID360s_config.json` 和对应 ROS1/ROS2 launch 供显式启动。
 
 ```json
 {
@@ -176,7 +181,7 @@ roslaunch livox_ros_driver2 msg_MID360.launch xfer_format:=1
 ### 关键设计
 
 - **点云与 IMU 同步旋转**：驱动已在 `pub_handler.cpp` 中实现"外参旋转同时作用到点云与 IMU 输出"（L161-172），保证 SLAM 算法正常耦合
-- **不改 C++ 源码**：仅修改配置文件，兼容官方驱动升级
+- **最小 C++ 改动**：保留现有自动水平校准逻辑，仅补充 MID360S 的设备类型处理；型号发现和网络通道仍由 Livox-SDK2 完成
 - **单位兼容**：自动识别 IMU 加速度单位（`1g` 或 `9.81m/s²`）
 
 ---
@@ -209,14 +214,18 @@ roslaunch livox_ros_driver2 msg_MID360.launch xfer_format:=1
 
 ## 与官方版本差异
 
-本仓库基于 [Livox-SDK/livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2) v1.2.4，新增：
+本仓库基于 [Livox-SDK/livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2) v1.2.4，并回移官方 `13eb05e` 中与 MID360S 相关的必要能力，同时保留本仓库的自动水平校准定制：
 
 - `scripts/mid360_autolevel_calib.py`：自动水平校准脚本
 - `scripts/calib_and_visualize.sh`：一键校准 + 可视化验证
 - `launch_ROS1/autolevel_MID360.launch`：使用校准配置的启动文件
 - `config/MID360_config_calib.json`：校准输出配置（自动生成）
+- `config/MID360s_config.json`：MID360S 独立配置
+- `launch_ROS1/msg_MID360s.launch` / `rviz_MID360s.launch`：ROS1 MID360S 启动入口
+- `launch_ROS2/msg_MID360s_launch.py` / `rviz_MID360s_launch.py`：ROS2 MID360S 启动入口
+- `MID360_config*.json` 同时注册 `MID360` / `Mid360s`，现有自动校准启动链无需预先选择型号
 
-其余功能与官方版本完全一致。
+没有直接 merge 官方 master，避免覆盖本仓库已有的自动校准、IMU/点云同步旋转和 Faster-LIO 外参同步逻辑。
 
 ---
 

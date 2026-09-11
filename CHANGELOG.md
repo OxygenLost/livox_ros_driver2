@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.5]
+### Added
+- Backport MID360S support from upstream commit `13eb05e` while preserving the local auto-level calibration workflow.
+- Add MID360S ROS1/ROS2 launch files and standalone configuration.
+- Register both MID360 and MID360S in the generic/calibrated config so auto-level startup can discover either model.
+
 ## [1.2.4]
 ### Fixed
 - Optimize framing performance

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MID360 Auto-level calibration (ROS1)
+MID360 / MID360S Auto-level calibration (ROS1)
 """
 import argparse
 import json
@@ -226,7 +226,7 @@ class _ImuAccumulator(object):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MID360 auto-level calibration")
+    parser = argparse.ArgumentParser(description="MID360 / MID360S auto-level calibration")
     parser.add_argument("--base-config", type=str, default="", help="Base config json path")
     parser.add_argument("--imu-topic", type=str, default="/livox/imu", help="IMU topic")
     parser.add_argument("--lidar-topic", type=str, default="/livox/lidar", help="Lidar topic")
