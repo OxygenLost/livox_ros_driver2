@@ -28,11 +28,74 @@
 #include <time.h>
 #include <chrono>
 #include <algorithm>
+#include <array>
+#include <iostream>
+#include <mutex>
 
 #include "lds.h"
 #include "comm/ldq.h"
 
 namespace livox_ros {
+
+namespace {
+
+constexpr uint64_t kStorageDiagSummaryPeriodMs = 1000;
+constexpr uint64_t kStorageDropLogPeriodMs = 5000;
+
+struct StorageQueueDiag {
+  uint64_t drop_total = 0;
+  uint32_t high_watermark = 0;
+  uint64_t last_summary_ms = 0;
+  uint64_t last_drop_log_ms = 0;
+};
+
+std::mutex g_storage_diag_mutex;
+std::array<StorageQueueDiag, kMaxSourceLidar> g_storage_diag;
+
+uint64_t StorageSteadyNowMs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void TrackStorageQueue(const uint8_t index, const uint32_t handle,
+                       const uint32_t used, const uint32_t capacity, bool dropped) {
+  if (index >= g_storage_diag.size()) {
+    return;
+  }
+  const uint64_t now_ms = StorageSteadyNowMs();
+  std::lock_guard<std::mutex> lock(g_storage_diag_mutex);
+  StorageQueueDiag& diag = g_storage_diag[index];
+  diag.high_watermark = std::max(diag.high_watermark, used);
+  if (dropped) {
+    ++diag.drop_total;
+    if (diag.drop_total == 1 || diag.last_drop_log_ms == 0 ||
+        now_ms - diag.last_drop_log_ms >= kStorageDropLogPeriodMs) {
+      std::cerr << "[LIVOX_QUEUE_EVENT] type=storage_queue_full"
+                << " index=" << static_cast<uint32_t>(index)
+                << " ip=" << IpNumToString(handle)
+                << " used=" << used
+                << " capacity=" << capacity
+                << " drop_total=" << diag.drop_total
+                << std::endl;
+      diag.last_drop_log_ms = now_ms;
+    }
+  }
+
+  if (diag.last_summary_ms == 0 ||
+      now_ms - diag.last_summary_ms >= kStorageDiagSummaryPeriodMs) {
+    std::cout << "[LIVOX_STORAGE_DIAG] index=" << static_cast<uint32_t>(index)
+              << " ip=" << IpNumToString(handle)
+              << " used=" << used
+              << " capacity=" << capacity
+              << " high_watermark=" << diag.high_watermark
+              << " drop_total=" << diag.drop_total
+              << std::endl;
+    diag.high_watermark = used;
+    diag.last_summary_ms = now_ms;
+  }
+}
+
+}  // namespace
 
 CacheIndex Lds::cache_index_;
 
@@ -183,12 +246,14 @@ void Lds::PushLidarData(PointPacket* lidar_data, const uint8_t index, const uint
 
   if (!QueueIsFull(queue)) {
     QueuePushAny(queue, (uint8_t *)lidar_data, base_time);
+    TrackStorageQueue(index, p_lidar->handle, QueueUsedSize(queue), queue->size, false);
     if (!QueueIsEmpty(queue)) {
       if (pcd_semaphore_.GetCount() <= 0) {
         pcd_semaphore_.Signal();
       }
     }
   } else {
+    TrackStorageQueue(index, p_lidar->handle, QueueUsedSize(queue), queue->size, true);
     if (pcd_semaphore_.GetCount() <= 0) {
         pcd_semaphore_.Signal();
     }

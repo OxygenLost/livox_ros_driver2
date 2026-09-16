@@ -25,11 +25,217 @@
 #include "pub_handler.h"
 
 #include <cstdlib>
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <mutex>
 
 namespace livox_ros {
+
+namespace {
+
+constexpr uint64_t kDriverDiagSummaryPeriodNs = 1000000000ULL;
+constexpr uint64_t kDriverTimestampGapWarnNs = 100000000ULL;
+constexpr size_t kDriverRawQueueWarnDepth = 100;
+
+struct PacketStreamDiag {
+  bool initialized = false;
+  uint8_t time_type = kTimestampTypeNoSync;
+  uint64_t last_timestamp = 0;
+  uint64_t packet_count = 0;
+  uint64_t rollback_count = 0;
+  uint64_t gap_count = 0;
+  uint64_t delta_min = std::numeric_limits<uint64_t>::max();
+  uint64_t delta_max = 0;
+};
+
+struct DriverPacketDiag {
+  PacketStreamDiag lidar;
+  PacketStreamDiag imu;
+  uint64_t raw_processed = 0;
+  size_t raw_queue_depth = 0;
+  size_t raw_queue_max = 0;
+  bool time_type_mismatch = false;
+  bool mismatch_initialized = false;
+  uint64_t last_raw_queue_warn_steady_ns = 0;
+  uint64_t last_summary_steady_ns = 0;
+};
+
+std::mutex g_driver_diag_mutex;
+std::map<uint32_t, DriverPacketDiag> g_driver_diag;
+
+uint64_t SteadyNowNs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+uint64_t SystemNowNs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+const char* TimestampTypeName(uint8_t time_type) {
+  switch (time_type) {
+    case kTimestampTypeNoSync:
+      return "no_sync_host_clock";
+    case kTimestampTypeGptpOrPtp:
+      return "ptp";
+    case kTimestampTypeGps:
+      return "gps";
+    default:
+      return "unknown";
+  }
+}
+
+void MaybePrintDriverDiagLocked(uint32_t handle, DriverPacketDiag& diag, uint64_t now_ns) {
+  if (diag.last_summary_steady_ns != 0 &&
+      now_ns - diag.last_summary_steady_ns < kDriverDiagSummaryPeriodNs) {
+    return;
+  }
+
+  const auto normalize_min = [](const PacketStreamDiag& stream) {
+    return stream.delta_min == std::numeric_limits<uint64_t>::max() ? 0 : stream.delta_min;
+  };
+
+  std::cout << "[LIVOX_DRIVER_DIAG] ip=" << IpNumToString(handle)
+            << " lidar_packets=" << diag.lidar.packet_count
+            << " imu_packets=" << diag.imu.packet_count
+            << " lidar_time_type=" << TimestampTypeName(diag.lidar.time_type)
+            << " imu_time_type=" << TimestampTypeName(diag.imu.time_type)
+            << " lidar_ts=" << diag.lidar.last_timestamp
+            << " imu_ts=" << diag.imu.last_timestamp
+            << " lidar_dt_min_ns=" << normalize_min(diag.lidar)
+            << " lidar_dt_max_ns=" << diag.lidar.delta_max
+            << " imu_dt_min_ns=" << normalize_min(diag.imu)
+            << " imu_dt_max_ns=" << diag.imu.delta_max
+            << " lidar_rollbacks=" << diag.lidar.rollback_count
+            << " imu_rollbacks=" << diag.imu.rollback_count
+            << " lidar_gaps=" << diag.lidar.gap_count
+            << " imu_gaps=" << diag.imu.gap_count
+            << " time_type_mismatch=" << (diag.time_type_mismatch ? 1 : 0)
+            << " raw_queue=" << diag.raw_queue_depth
+            << " raw_queue_max=" << diag.raw_queue_max
+            << " raw_processed=" << diag.raw_processed
+            << std::endl;
+
+  diag.lidar.delta_min = std::numeric_limits<uint64_t>::max();
+  diag.lidar.delta_max = 0;
+  diag.imu.delta_min = std::numeric_limits<uint64_t>::max();
+  diag.imu.delta_max = 0;
+  diag.raw_queue_max = diag.raw_queue_depth;
+  diag.last_summary_steady_ns = now_ns;
+}
+
+void TrackIncomingPacket(uint32_t handle, bool is_imu, uint8_t time_type,
+                         uint64_t timestamp, uint32_t dot_num,
+                         uint32_t packet_time_interval, uint64_t point_interval) {
+  const uint64_t now_ns = SteadyNowNs();
+  const uint64_t host_wall_ns = SystemNowNs();
+  std::lock_guard<std::mutex> lock(g_driver_diag_mutex);
+  DriverPacketDiag& diag = g_driver_diag[handle];
+  PacketStreamDiag& stream = is_imu ? diag.imu : diag.lidar;
+  const char* stream_name = is_imu ? "imu" : "lidar";
+
+  if (!stream.initialized) {
+    stream.initialized = true;
+    stream.time_type = time_type;
+  } else if (stream.time_type != time_type) {
+    std::cerr << "[LIVOX_CLOCK_SOURCE] ip=" << IpNumToString(handle)
+              << " stream=" << stream_name
+              << " old=" << TimestampTypeName(stream.time_type)
+              << " new=" << TimestampTypeName(time_type)
+              << " sdk_timestamp_ns=" << timestamp
+              << " host_wall_ns=" << host_wall_ns
+              << std::endl;
+    stream.time_type = time_type;
+  }
+
+  if (stream.last_timestamp != 0) {
+    if (timestamp <= stream.last_timestamp) {
+      ++stream.rollback_count;
+      const uint64_t backward_ns = stream.last_timestamp - timestamp;
+      std::cerr << "[LIVOX_TIME_EVENT] reason=timestamp_rollback"
+                << " ip=" << IpNumToString(handle)
+                << " stream=" << stream_name
+                << " time_type=" << TimestampTypeName(time_type)
+                << " previous_ns=" << stream.last_timestamp
+                << " current_ns=" << timestamp
+                << " backward_ns=" << backward_ns
+                << " host_wall_ns=" << host_wall_ns
+                << " dot_num=" << dot_num
+                << " packet_interval=" << packet_time_interval
+                << " point_interval_ns=" << point_interval
+                << std::endl;
+    } else {
+      const uint64_t delta = timestamp - stream.last_timestamp;
+      stream.delta_min = std::min(stream.delta_min, delta);
+      stream.delta_max = std::max(stream.delta_max, delta);
+      if (delta > kDriverTimestampGapWarnNs) {
+        ++stream.gap_count;
+        std::cerr << "[LIVOX_TIME_EVENT] reason=timestamp_gap"
+                  << " ip=" << IpNumToString(handle)
+                  << " stream=" << stream_name
+                  << " time_type=" << TimestampTypeName(time_type)
+                  << " previous_ns=" << stream.last_timestamp
+                  << " current_ns=" << timestamp
+                  << " delta_ns=" << delta
+                  << " host_wall_ns=" << host_wall_ns
+                  << " dot_num=" << dot_num
+                  << " packet_interval=" << packet_time_interval
+                  << " point_interval_ns=" << point_interval
+                  << std::endl;
+      }
+    }
+  }
+
+  stream.last_timestamp = timestamp;
+  ++stream.packet_count;
+  if (diag.lidar.initialized && diag.imu.initialized) {
+    const bool mismatch = diag.lidar.time_type != diag.imu.time_type;
+    if (!diag.mismatch_initialized || mismatch != diag.time_type_mismatch) {
+      std::cerr << "[LIVOX_CLOCK_SOURCE] reason=stream_time_type_mismatch"
+                << " ip=" << IpNumToString(handle)
+                << " lidar=" << TimestampTypeName(diag.lidar.time_type)
+                << " imu=" << TimestampTypeName(diag.imu.time_type)
+                << " mismatch=" << (mismatch ? 1 : 0)
+                << std::endl;
+      diag.mismatch_initialized = true;
+      diag.time_type_mismatch = mismatch;
+    }
+  }
+  MaybePrintDriverDiagLocked(handle, diag, now_ns);
+}
+
+void TrackRawQueue(uint32_t handle, size_t queue_depth) {
+  const uint64_t now_ns = SteadyNowNs();
+  std::lock_guard<std::mutex> lock(g_driver_diag_mutex);
+  DriverPacketDiag& diag = g_driver_diag[handle];
+  diag.raw_queue_depth = queue_depth;
+  diag.raw_queue_max = std::max(diag.raw_queue_max, queue_depth);
+  if (queue_depth >= kDriverRawQueueWarnDepth &&
+      (diag.last_raw_queue_warn_steady_ns == 0 ||
+       now_ns - diag.last_raw_queue_warn_steady_ns >= kDriverDiagSummaryPeriodNs)) {
+    std::cerr << "[LIVOX_QUEUE_EVENT] type=raw_packet_backlog"
+              << " ip=" << IpNumToString(handle)
+              << " depth=" << queue_depth
+              << std::endl;
+    diag.last_raw_queue_warn_steady_ns = now_ns;
+  }
+  MaybePrintDriverDiagLocked(handle, diag, now_ns);
+}
+
+void TrackRawProcessed(uint32_t handle, size_t queue_depth) {
+  const uint64_t now_ns = SteadyNowNs();
+  std::lock_guard<std::mutex> lock(g_driver_diag_mutex);
+  DriverPacketDiag& diag = g_driver_diag[handle];
+  ++diag.raw_processed;
+  diag.raw_queue_depth = queue_depth;
+  MaybePrintDriverDiagLocked(handle, diag, now_ns);
+}
+
+}  // namespace
 
 std::atomic<bool> PubHandler::is_timestamp_sync_;
 
@@ -133,7 +339,11 @@ void PubHandler::SetPointCloudsCallback(PointCloudsCallback cb, void* client_dat
 void PubHandler::OnLivoxLidarPointCloudCallback(uint32_t handle, const uint8_t dev_type,
                                                 LivoxLidarEthernetPacket *data, void *client_data) {
   PubHandler* self = (PubHandler*)client_data;
-  if (!self) {
+  if (!self || !data) {
+    if (!data) {
+      std::cerr << "[LIVOX_DRIVER_EVENT] reason=null_packet ip=" << IpNumToString(handle)
+                << std::endl;
+    }
     return;
   }
 
@@ -151,6 +361,8 @@ void PubHandler::OnLivoxLidarPointCloudCallback(uint32_t handle, const uint8_t d
       imu_data.handle = handle;
       imu_data.time_stamp = GetEthPacketTimestamp(data->time_type,
                                                   data->timestamp, sizeof(data->timestamp));
+      TrackIncomingPacket(handle, true, data->time_type, imu_data.time_stamp,
+                          data->dot_num, data->time_interval, 0);
       imu_data.gyro_x = imu->gyro_x;
       imu_data.gyro_y = imu->gyro_y;
       imu_data.gyro_z = imu->gyro_z;
@@ -189,16 +401,34 @@ void PubHandler::OnLivoxLidarPointCloudCallback(uint32_t handle, const uint8_t d
   }
   packet.data_type = data->data_type;
   packet.point_num = data->dot_num;
+  if (data->dot_num == 0) {
+    const uint64_t timestamp = GetEthPacketTimestamp(data->time_type,
+                                                     data->timestamp, sizeof(data->timestamp));
+    TrackIncomingPacket(handle, false, data->time_type, timestamp,
+                        data->dot_num, data->time_interval, 0);
+    std::cerr << "[LIVOX_DRIVER_EVENT] reason=zero_dot_num"
+              << " ip=" << IpNumToString(handle)
+              << " data_type=" << static_cast<int>(data->data_type)
+              << " time_type=" << TimestampTypeName(data->time_type)
+              << " timestamp_ns=" << timestamp
+              << std::endl;
+    return;
+  }
   packet.point_interval = data->time_interval * 100 / data->dot_num;  //ns
   packet.time_stamp = GetEthPacketTimestamp(data->time_type,
                                             data->timestamp, sizeof(data->timestamp));
+  TrackIncomingPacket(handle, false, data->time_type, packet.time_stamp,
+                      data->dot_num, data->time_interval, packet.point_interval);
   uint32_t length = data->length - sizeof(LivoxLidarEthernetPacket) + 1;
   packet.raw_data.insert(packet.raw_data.end(), data->data, data->data + length);
+  size_t raw_queue_depth = 0;
   {
     std::unique_lock<std::mutex> lock(self->packet_mutex_);
     self->raw_packet_queue_.push_back(packet);
+    raw_queue_depth = self->raw_packet_queue_.size();
   }
-    self->packet_condition_.notify_one();
+  TrackRawQueue(handle, raw_queue_depth);
+  self->packet_condition_.notify_one();
 
   return;
 }
@@ -279,6 +509,7 @@ void PubHandler::CheckTimer(uint32_t id) {
 void PubHandler::RawDataProcess() {
   RawPacket raw_data;
   while (!is_quit_.load()) {
+    size_t queue_depth_after_pop = 0;
     {
       std::unique_lock<std::mutex> lock(packet_mutex_);
       if (raw_packet_queue_.empty()) {
@@ -289,7 +520,9 @@ void PubHandler::RawDataProcess() {
       }
       raw_data = raw_packet_queue_.front();
       raw_packet_queue_.pop_front();
+      queue_depth_after_pop = raw_packet_queue_.size();
     }
+    TrackRawProcessed(raw_data.handle, queue_depth_after_pop);
     uint32_t id = 0;
     GetLidarId(raw_data.lidar_type, raw_data.handle, id);
     if (lidar_process_handlers_.find(id) == lidar_process_handlers_.end()) {

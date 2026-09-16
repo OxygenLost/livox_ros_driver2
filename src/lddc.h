@@ -111,7 +111,7 @@ class Lddc final {
   void PublishPointcloud2Data(const uint8_t index, uint64_t timestamp, const PointCloud2& cloud);
 
   void InitCustomMsg(CustomMsg& livox_msg, const StoragePacket& pkg, uint8_t index);
-  void FillPointsToCustomMsg(CustomMsg& livox_msg, const StoragePacket& pkg);
+  void FillPointsToCustomMsg(CustomMsg& livox_msg, const StoragePacket& pkg, uint32_t diag_handle);
   void PublishCustomPointData(const CustomMsg& livox_msg, const uint8_t index);
 
   void InitPclMsg(const StoragePacket& pkg, PointCloud& cloud, uint64_t& timestamp);

@@ -27,10 +27,15 @@
 #include "comm/comm.h"
 
 #include <inttypes.h>
+#include <algorithm>
 #include <iostream>
 #include <iomanip>
 #include <math.h>
 #include <stdint.h>
+#include <chrono>
+#include <limits>
+#include <map>
+#include <mutex>
 
 #include "include/ros_headers.h"
 
@@ -38,6 +43,108 @@
 #include "lds_lidar.h"
 
 namespace livox_ros {
+
+namespace {
+
+constexpr uint64_t kPublishDiagSummaryPeriodNs = 1000000000ULL;
+constexpr uint64_t kCustomOffsetWarnNs = 500000000ULL;
+
+struct PublishDiag {
+  uint64_t lidar_publish_count = 0;
+  uint64_t imu_publish_count = 0;
+  uint64_t lidar_since_summary = 0;
+  uint64_t imu_since_summary = 0;
+  uint64_t last_lidar_timestamp = 0;
+  uint64_t last_imu_timestamp = 0;
+  uint64_t offset_max = 0;
+  uint64_t offset_underflow_count = 0;
+  uint64_t offset_overflow_count = 0;
+  uint64_t offset_non_monotonic_count = 0;
+  uint64_t last_summary_steady_ns = 0;
+};
+
+std::mutex g_publish_diag_mutex;
+std::map<uint32_t, PublishDiag> g_publish_diag;
+
+uint64_t PublishDiagSteadyNowNs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void MaybePrintPublishDiagLocked(uint32_t handle, PublishDiag& diag, uint64_t now_ns) {
+  if (diag.last_summary_steady_ns != 0 &&
+      now_ns - diag.last_summary_steady_ns < kPublishDiagSummaryPeriodNs) {
+    return;
+  }
+
+  int64_t imu_minus_lidar_ns = 0;
+  if (diag.last_imu_timestamp >= diag.last_lidar_timestamp) {
+    const uint64_t diff = diag.last_imu_timestamp - diag.last_lidar_timestamp;
+    imu_minus_lidar_ns = diff > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+        ? std::numeric_limits<int64_t>::max()
+        : static_cast<int64_t>(diff);
+  } else {
+    const uint64_t diff = diag.last_lidar_timestamp - diag.last_imu_timestamp;
+    imu_minus_lidar_ns = diff > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
+        ? std::numeric_limits<int64_t>::min()
+        : -static_cast<int64_t>(diff);
+  }
+
+  std::cout << "[LIVOX_PUBLISH_DIAG] ip=" << IpNumToString(handle)
+            << " lidar_pub_total=" << diag.lidar_publish_count
+            << " imu_pub_total=" << diag.imu_publish_count
+            << " lidar_pub_last_sec=" << diag.lidar_since_summary
+            << " imu_pub_last_sec=" << diag.imu_since_summary
+            << " lidar_ts=" << diag.last_lidar_timestamp
+            << " imu_ts=" << diag.last_imu_timestamp
+            << " imu_minus_lidar_ns=" << imu_minus_lidar_ns
+            << " offset_max_ns=" << diag.offset_max
+            << " offset_underflow=" << diag.offset_underflow_count
+            << " offset_overflow=" << diag.offset_overflow_count
+            << " offset_non_monotonic=" << diag.offset_non_monotonic_count
+            << std::endl;
+
+  diag.lidar_since_summary = 0;
+  diag.imu_since_summary = 0;
+  diag.offset_max = 0;
+  diag.offset_underflow_count = 0;
+  diag.offset_overflow_count = 0;
+  diag.offset_non_monotonic_count = 0;
+  diag.last_summary_steady_ns = now_ns;
+}
+
+void TrackCustomOffsets(uint32_t handle, uint64_t offset_max,
+                        uint64_t underflow_count, uint64_t overflow_count,
+                        uint64_t non_monotonic_count) {
+  std::lock_guard<std::mutex> lock(g_publish_diag_mutex);
+  PublishDiag& diag = g_publish_diag[handle];
+  diag.offset_max = std::max(diag.offset_max, offset_max);
+  diag.offset_underflow_count += underflow_count;
+  diag.offset_overflow_count += overflow_count;
+  diag.offset_non_monotonic_count += non_monotonic_count;
+}
+
+void TrackLidarPublish(uint32_t handle, uint64_t timestamp) {
+  const uint64_t now_ns = PublishDiagSteadyNowNs();
+  std::lock_guard<std::mutex> lock(g_publish_diag_mutex);
+  PublishDiag& diag = g_publish_diag[handle];
+  ++diag.lidar_publish_count;
+  ++diag.lidar_since_summary;
+  diag.last_lidar_timestamp = timestamp;
+  MaybePrintPublishDiagLocked(handle, diag, now_ns);
+}
+
+void TrackImuPublish(uint32_t handle, uint64_t timestamp) {
+  const uint64_t now_ns = PublishDiagSteadyNowNs();
+  std::lock_guard<std::mutex> lock(g_publish_diag_mutex);
+  PublishDiag& diag = g_publish_diag[handle];
+  ++diag.imu_publish_count;
+  ++diag.imu_since_summary;
+  diag.last_imu_timestamp = timestamp;
+  MaybePrintPublishDiagLocked(handle, diag, now_ns);
+}
+
+}  // namespace
 
 /** Lidar Data Distribute Control--------------------------------------------*/
 #ifdef BUILDING_ROS1
@@ -225,7 +332,7 @@ void Lddc::PublishCustomPointcloud(LidarDataQueue *queue, uint8_t index) {
 
     CustomMsg livox_msg;
     InitCustomMsg(livox_msg, pkg, index);
-    FillPointsToCustomMsg(livox_msg, pkg);
+    FillPointsToCustomMsg(livox_msg, pkg, lds_->lidars_[index].handle);
     PublishCustomPointData(livox_msg, index);
   }
 }
@@ -381,9 +488,16 @@ void Lddc::InitCustomMsg(CustomMsg& livox_msg, const StoragePacket& pkg, uint8_t
   }
 }
 
-void Lddc::FillPointsToCustomMsg(CustomMsg& livox_msg, const StoragePacket& pkg) {
+void Lddc::FillPointsToCustomMsg(CustomMsg& livox_msg, const StoragePacket& pkg, uint32_t diag_handle) {
   uint32_t points_num = pkg.points_num;
   const std::vector<PointXyzlt>& points = pkg.points;
+  uint64_t offset_max = 0;
+  uint64_t underflow_count = 0;
+  uint64_t overflow_count = 0;
+  uint64_t non_monotonic_count = 0;
+  uint64_t previous_point_time = 0;
+  uint32_t first_bad_index = std::numeric_limits<uint32_t>::max();
+  uint64_t first_bad_point_time = 0;
   for (uint32_t i = 0; i < points_num; ++i) {
     CustomPoint point;
     point.x = points[i].x;
@@ -392,10 +506,52 @@ void Lddc::FillPointsToCustomMsg(CustomMsg& livox_msg, const StoragePacket& pkg)
     point.reflectivity = points[i].intensity;
     point.tag = points[i].tag;
     point.line = points[i].line;
+    if (points[i].offset_time < pkg.base_time) {
+      ++underflow_count;
+      if (first_bad_index == std::numeric_limits<uint32_t>::max()) {
+        first_bad_index = i;
+        first_bad_point_time = points[i].offset_time;
+      }
+    } else {
+      const uint64_t offset = points[i].offset_time - pkg.base_time;
+      offset_max = std::max(offset_max, offset);
+      if (offset > std::numeric_limits<uint32_t>::max()) {
+        ++overflow_count;
+        if (first_bad_index == std::numeric_limits<uint32_t>::max()) {
+          first_bad_index = i;
+          first_bad_point_time = points[i].offset_time;
+        }
+      }
+    }
+    if (i > 0 && points[i].offset_time < previous_point_time) {
+      ++non_monotonic_count;
+      if (first_bad_index == std::numeric_limits<uint32_t>::max()) {
+        first_bad_index = i;
+        first_bad_point_time = points[i].offset_time;
+      }
+    }
+    previous_point_time = points[i].offset_time;
     point.offset_time = static_cast<uint32_t>(points[i].offset_time - pkg.base_time);
 
     livox_msg.points.push_back(std::move(point));
   }
+
+  if (underflow_count != 0 || overflow_count != 0 || offset_max > kCustomOffsetWarnNs) {
+    std::cerr << "[LIVOX_OFFSET_EVENT] ip=" << IpNumToString(diag_handle)
+              << " base_time_ns=" << pkg.base_time
+              << " points=" << points_num
+              << " offset_max_ns=" << offset_max
+              << " underflow=" << underflow_count
+              << " overflow=" << overflow_count
+              << " non_monotonic=" << non_monotonic_count;
+    if (first_bad_index != std::numeric_limits<uint32_t>::max()) {
+      std::cerr << " first_bad_index=" << first_bad_index
+                << " first_bad_point_time_ns=" << first_bad_point_time;
+    }
+    std::cerr << std::endl;
+  }
+  TrackCustomOffsets(diag_handle, offset_max, underflow_count,
+                     overflow_count, non_monotonic_count);
 }
 
 void Lddc::PublishCustomPointData(const CustomMsg& livox_msg, const uint8_t index) {
@@ -414,6 +570,7 @@ void Lddc::PublishCustomPointData(const CustomMsg& livox_msg, const uint8_t inde
     }
 #endif
   }
+  TrackLidarPublish(lds_->lidars_[index].handle, livox_msg.timebase);
 }
 
 void Lddc::InitPclMsg(const StoragePacket& pkg, PointCloud& cloud, uint64_t& timestamp) {
@@ -521,6 +678,7 @@ void Lddc::PublishImuData(LidarImuDataQueue& imu_data_queue, const uint8_t index
     }
 #endif
   }
+  TrackImuPublish(imu_data.handle, timestamp);
 }
 
 #ifdef BUILDING_ROS2
