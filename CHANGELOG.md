@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.8] - MID360L selective backport
+### Added
+- Backport MID360L device configuration and ROS1/ROS2 launch entries from upstream `2144554`, without replacing local auto-level and packet/queue telemetry code.
+- Register MID360L alongside MID360/MID360S in the shared calibration configs, and assign MID360L the same lidar line count as MID360.
+- Allow the auto-level ROS1 launcher and calibration script to use a device-specific calibrated JSON file.
+
+### Requires
+- Livox SDK2 **1.5.0+** for MID360L; tested SDK2 1.5.2 on the ARM64 target. This is a targeted backport, not a wholesale upstream v1.2.8 sync.
+
 ## [1.2.5]
 ### Added
 - Backport MID360S support from upstream commit `13eb05e` while preserving the local auto-level calibration workflow.

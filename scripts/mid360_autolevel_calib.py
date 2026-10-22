@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MID360 / MID360S Auto-level calibration (ROS1)
+MID360 / MID360S / MID360L Auto-level calibration (ROS1)
 """
 import argparse
 import json
@@ -226,8 +226,9 @@ class _ImuAccumulator(object):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MID360 / MID360S auto-level calibration")
+    parser = argparse.ArgumentParser(description="MID360 / MID360S / MID360L auto-level calibration")
     parser.add_argument("--base-config", type=str, default="", help="Base config json path")
+    parser.add_argument("--output-config", type=str, default="", help="Calibrated output JSON path (defaults to MID360_config_calib.json)")
     parser.add_argument("--imu-topic", type=str, default="/livox/imu", help="IMU topic")
     parser.add_argument("--lidar-topic", type=str, default="/livox/lidar", help="Lidar topic")
     parser.add_argument("--duration", type=float, default=3.0, help="Calibration duration (s)")
@@ -240,7 +241,7 @@ def main():
 
     pkg_path = rospkg.RosPack().get_path("livox_ros_driver2")
     base_cfg_path = args.base_config if args.base_config else os.path.join(pkg_path, "config", "MID360_config.json")
-    output_cfg_path = os.path.join(pkg_path, "config", "MID360_config_calib.json")
+    output_cfg_path = args.output_config if args.output_config else os.path.join(pkg_path, "config", "MID360_config_calib.json")
     temp_raw_cfg_path = "/tmp/MID360_config_raw_extrinsic0.json"
     
     target_ip = args.target_ip if args.target_ip else None

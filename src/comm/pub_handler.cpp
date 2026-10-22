@@ -394,7 +394,8 @@ void PubHandler::OnLivoxLidarPointCloudCallback(uint32_t handle, const uint8_t d
   if (dev_type == LivoxLidarDeviceType::kLivoxLidarTypeIndustrialHAP) {
     packet.line_num = kLineNumberHAP;
   } else if (dev_type == LivoxLidarDeviceType::kLivoxLidarTypeMid360 ||
-             dev_type == LivoxLidarDeviceType::kLivoxLidarTypeMid360s) {
+             dev_type == LivoxLidarDeviceType::kLivoxLidarTypeMid360s ||
+             dev_type == LivoxLidarDeviceType::kLivoxLidarTypeMid360l) {
     packet.line_num = kLineNumberMid360;
   } else {
     packet.line_num = kLineNumberDefault;
